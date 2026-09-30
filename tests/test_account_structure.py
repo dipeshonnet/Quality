@@ -257,6 +257,24 @@ class AccountStructureTests(unittest.TestCase):
         self.assertEqual(quality.get_sampling_controls(p, user="admin")["audits_per_associate"], 9)
         self.assertEqual(quality.user_context("scoped")["account_roles"][0]["account_id"], a)
 
+    def test_readiness_rejects_missing_postgres_account_schema(self):
+        with patch.object(app, 'uses_postgres', return_value=True), patch.object(app, 'db') as database:
+            database.return_value.__enter__.return_value.execute.side_effect = RuntimeError('missing table')
+            response = asyncio.run(app.readyz())
+            self.assertEqual(response.status_code, 503)
+            self.assertIn(b'alembic upgrade head', response.body)
+            self.assertNotIn(b'missing table', response.body)
+
+    def test_readiness_checks_new_tables_and_upload_owner(self):
+        with patch.object(app, 'uses_postgres', return_value=True), patch.object(app, 'db') as database:
+            self.assertEqual(asyncio.run(app.readyz()), {'status': 'ready'})
+            statements = [call.args[0] for call in database.return_value.__enter__.return_value.execute.call_args_list]
+            self.assertEqual(len(statements), 4)
+            self.assertTrue(any('account_user_roles' in sql for sql in statements))
+            self.assertTrue(any('legacy_user_roles' in sql for sql in statements))
+            self.assertTrue(any('process_sampling_config' in sql for sql in statements))
+            self.assertTrue(any('created_by FROM uploads' in sql for sql in statements))
+
 
 if __name__ == '__main__':
     unittest.main()

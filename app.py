@@ -764,7 +764,19 @@ def healthz():
 
 @app.get("/readyz", include_in_schema=False)
 async def readyz():
-    # Temporary Render diagnostic: bypass database and storage readiness checks.
+    if uses_postgres():
+        try:
+            with db() as con:
+                for statement in (
+                    "SELECT username,account_id,role_name FROM account_user_roles LIMIT 0",
+                    "SELECT username,role_name FROM legacy_user_roles LIMIT 0",
+                    "SELECT process_id,coverage_enabled FROM process_sampling_config LIMIT 0",
+                    "SELECT created_by FROM uploads LIMIT 0",
+                ):
+                    con.execute(statement)
+        except Exception:
+            logger.error("readiness_failed: PostgreSQL account schema unavailable; run alembic upgrade head using the migration role")
+            return JSONResponse(status_code=503, content={"status": "not_ready", "detail": "Database schema unavailable. Run alembic upgrade head using the migration role."})
     return {"status": "ready"}
 
 

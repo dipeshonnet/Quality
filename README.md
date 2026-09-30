@@ -1,8 +1,14 @@
 # Quality Command Center
 
-Quality Command Center is a localhost FastAPI application for operational sampling, scorecard audits, Six Sigma analytics, CAPA, and controlled administration. It uses SQLite, works offline after setup, and preserves the original sampling history and exports.
+Quality Command Center supports operational sampling, versioned scorecard audits, Six Sigma analytics, corrective and preventive action (CAPA), reporting, and account-scoped administration. The application in `main` uses FastAPI with a bundled web interface. It runs locally with SQLite and supports PostgreSQL and Supabase Storage for hosted backend deployments.
 
-## Start on Windows
+## Hosted site
+
+Explore the [Quality Command Center visual demo](https://qccenter.netlify.app/). The Netlify site is built from the separate `netlify-site` branch and uses sample data. It is not connected to the FastAPI application in `main`, so actions on the demo do not create or change application records.
+
+The live application code and local run instructions are below. The planned Netlify frontend and Render API integration is documented in [`docs/migration/50-master-plan.md`](docs/migration/50-master-plan.md).
+
+## Run locally on Windows
 
 1. Install Python 3.11 or later from python.org. During installation, enable **Add Python to PATH**.
 2. Double-click `start_windows.bat`.
@@ -44,9 +50,11 @@ Both panels in **Admin → Process policies** require Account and Process. Sampl
 
 ## Account-structure upgrade
 
-SQLite applies schema version 3 automatically at startup. PostgreSQL deployments must run `alembic upgrade head` using the migration connection before starting this backend/frontend release; the new revision is `0002_account_structure`. Take the usual database backup before upgrading.
+SQLite applies schema version 3 automatically at startup. PostgreSQL deployments must run `alembic upgrade head` using the migration connection before starting this backend/frontend release. Revision `0002_account_structure` adds the schema; `0003_account_table_access` grants the backend role access under row-level security while denying browser roles. Take the usual database backup before upgrading. Render's current build/start commands do not run migrations: run them separately with the migration role before deploying. The readiness endpoint rejects missing account-schema tables instead of reporting a broken release as ready.
 
 The migration copies each account's sampling controls into its existing processes once. Future processes start with application defaults. Administrator grants and credentials remain intact. Existing global non-Administrator grants are retained as migration reference, but no longer authorize access: Admin must assign accounts to users marked **Account assignment required**. Repeat startups preserve the new grants and settings.
+
+PostgreSQL revision `0004_sampling_table_access` adds backend-only row-level security policies for `uploads`, `sampling_runs`, and `sample_records`, including access to the sample-record identity sequence. Without these policies, storage may accept a file while saving its upload record fails. Run `alembic upgrade head`, or use `docs/repair-sampling-access.sql` in Supabase SQL Editor when the database is at revision `0003_account_table_access`. Browser roles remain denied; account and upload-owner authorization stays enforced by the API.
 
 User APIs now expose global `roles` (Administrator only) and `account_roles`, for example `[{"account_id": 1, "roles": ["QA Auditor"]}]`. Sampling configuration uses `GET/PUT /api/admin/processes/{process_id}/sampling-controls`. The former account configuration PUT returns HTTP 410 and points callers to the process endpoint. No automatic grant is made when a new account is created.
 
