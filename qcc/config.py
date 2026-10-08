@@ -8,7 +8,8 @@ from dotenv import load_dotenv
 
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
-load_dotenv(PROJECT_DIR / ".env", override=False)
+DEFAULT_ENV_FILE = Path.home() / ".config" / "quality-command-center" / ".env"
+load_dotenv(Path(os.getenv("QCC_ENV_FILE", str(DEFAULT_ENV_FILE))).expanduser(), override=False)
 
 
 def _placeholder(value: str | None) -> bool:

@@ -34,6 +34,7 @@ class QualityCommandCenterTests(unittest.TestCase):
                     con = MagicMock()
                     con.execute.return_value.fetchone.return_value = {
                         "username": "admin",
+                        "active": 1,
                         "expires_at": expiry.isoformat() if as_text else expiry,
                     }
                     with patch.object(app, "db") as database, patch.object(app, "utcnow", return_value=now):

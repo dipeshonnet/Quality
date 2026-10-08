@@ -7,10 +7,9 @@ import json
 import math
 import re
 import secrets
-from collections import defaultdict
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from statistics import NormalDist, mean
+from statistics import mean
 from typing import Any
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
@@ -29,6 +28,7 @@ from app import (
     iso_now,
     password_hash,
 )
+from qcc.analytics import sigma_level as _sigma_level, summarize_quality
 from qcc.database import uses_postgres
 from qcc import access
 from qcc.account_schema import statements, initialize_process, sampling_config
@@ -734,6 +734,8 @@ def save_admin_user(payload: UserIn, user: str = Depends(require_roles("Administ
                must_change_password=excluded.must_change_password,updated_at=excluded.updated_at""",
             (username, payload.display_name.strip(), int(payload.active), int(payload.must_change_password), iso_now()),
         )
+        if not payload.active or payload.password:
+            con.execute("DELETE FROM sessions WHERE username=?", (username,))
         con.execute("DELETE FROM user_roles WHERE username=?", (username,))
         for role in set(payload.roles):
             con.execute("INSERT INTO user_roles(username,role_name) VALUES(?,?)", (username, role))
@@ -1093,13 +1095,19 @@ def _read_result_file(file: UploadFile, content: bytes) -> tuple[list[str], list
     if ext != ".xlsx":
         raise HTTPException(400, "Historical results must be XLSX or CSV")
     wb = load_workbook(io.BytesIO(content), read_only=True, data_only=True)
-    ws = wb.active
-    rows = list(ws.iter_rows(values_only=True))
-    wb.close()
-    if not rows:
-        return [], []
-    headers = [str(v or f"Column {i+1}").strip() for i, v in enumerate(rows[0])]
-    return headers, [{h: str(row[i] if i < len(row) and row[i] is not None else "").strip() for i, h in enumerate(headers)} for row in rows[1:]]
+    try:
+        rows = wb.active.iter_rows(values_only=True)
+        first = next(rows, None)
+        if first is None:
+            return [], []
+        headers = [str(v or f"Column {i+1}").strip() for i, v in enumerate(first)]
+        records = [
+            {h: str(row[i] if i < len(row) and row[i] is not None else "").strip() for i, h in enumerate(headers)}
+            for row in rows
+        ]
+        return headers, records
+    finally:
+        wb.close()
 
 
 @router.post("/api/results/imports")
@@ -1266,13 +1274,6 @@ def _date_filters(date_from: str | None, date_to: str | None) -> tuple[str, list
     return _range_filters("COALESCE(c.reviewed_at,c.submitted_at)", date_from, date_to)
 
 
-def _sigma_level(dpmo: float) -> float:
-    if dpmo <= 0:
-        return 6.0
-    yield_rate = min(0.999999999, max(0.000000001, 1 - dpmo / 1_000_000))
-    return max(0.0, min(6.0, NormalDist().inv_cdf(yield_rate) + 1.5))
-
-
 def analytics_payload(account_id: int | None, process_id: int | None, date_from: str | None, date_to: str | None, user: str = "admin") -> dict[str, Any]:
     where = ["c.status='REVIEWED'"]
     params: list[Any] = []
@@ -1287,15 +1288,21 @@ def analytics_payload(account_id: int | None, process_id: int | None, date_from:
         clause, scoped = access.scope(con, user, "p.account_id", account_id, process_id)
         sql_where += " AND " + clause
         params += scoped
-        cases = [dict(r) for r in con.execute(
-            f"""SELECT c.*,p.account_id,p.active process_active,p.name process_name,p.process_type,a.name account_name
-                 FROM audit_cases c JOIN processes p ON p.id=c.process_id JOIN accounts a ON a.id=p.account_id
-                 WHERE {sql_where} ORDER BY COALESCE(c.reviewed_at,c.submitted_at)""", params).fetchall()]
-        audit_ids = [c["audit_id"] for c in cases]
-        defects: list[dict[str, Any]] = []
-        if audit_ids:
-            marks = ",".join("?" for _ in audit_ids)
-            defects = [dict(r) for r in con.execute(f"SELECT * FROM audit_defects WHERE audit_id IN ({marks})", audit_ids).fetchall()]
+        # Aggregate before materializing rows: large histories stay in the database.
+        days = [dict(r) for r in con.execute(
+            f"""SELECT substr(CAST(COALESCE(c.reviewed_at,c.submitted_at,c.created_at) AS TEXT),1,10) label,
+                       COUNT(*) n,
+                       SUM(COALESCE(c.defect_count,0)) defects,
+                       SUM(CASE WHEN c.defect_count>0 THEN 1 ELSE 0 END) defective,
+                       SUM(CASE WHEN COALESCE(c.opportunities,0)<1 THEN 1 ELSE c.opportunities END) opportunities,
+                       SUM(CASE WHEN c.critical_fail<>0 THEN 1 ELSE 0 END) critical
+                FROM audit_cases c JOIN processes p ON p.id=c.process_id
+                WHERE {sql_where} GROUP BY 1 ORDER BY 1""", params).fetchall()]
+        categories = [dict(r) for r in con.execute(
+            f"""SELECT COALESCE(NULLIF(d.category,''),d.name) category, COUNT(*) count
+                FROM audit_defects d JOIN audit_cases c ON c.audit_id=d.audit_id
+                JOIN processes p ON p.id=c.process_id
+                WHERE {sql_where} GROUP BY 1""", params).fetchall()]
         capa_where, capa_params = [], []
         if process_id:
             capa_where.append("process_id=?"); capa_params.append(process_id)
@@ -1306,44 +1313,7 @@ def analytics_payload(account_id: int | None, process_id: int | None, date_from:
         capa_params += scoped
         sql_capa = "WHERE " + " AND ".join(capa_where)
         capas = [dict(r) for r in con.execute(f"SELECT * FROM capas {sql_capa} ORDER BY CASE priority WHEN 'CRITICAL' THEN 0 WHEN 'HIGH' THEN 1 ELSE 2 END,due_date LIMIT 12", capa_params).fetchall()]
-    units = len(cases)
-    defect_count = sum(int(c["defect_count"] or 0) for c in cases)
-    opportunities = sum(max(1, int(c["opportunities"] or 1)) for c in cases)
-    defective = sum(1 for c in cases if int(c["defect_count"] or 0) > 0)
-    critical = sum(1 for c in cases if bool(c["critical_fail"]))
-    yield_pct = (units - defective) / units * 100 if units else 0
-    dpu = defect_count / units if units else 0
-    dpmo = defect_count / opportunities * 1_000_000 if opportunities else 0
-    groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    for c in cases:
-        stamp = str(c["reviewed_at"] or c["submitted_at"] or c["created_at"])
-        groups[stamp[:10]].append(c)
-    pbar = defective / units if units else 0
-    ubar = defect_count / units if units else 0
-    chart = []
-    for key, rows in sorted(groups.items()):
-        n = len(rows)
-        d = sum(1 for r in rows if int(r["defect_count"] or 0) > 0)
-        defects_n = sum(int(r["defect_count"] or 0) for r in rows)
-        p = d / n
-        se = math.sqrt(pbar * (1 - pbar) / n) if n and pbar else 0
-        use = math.sqrt(ubar / n) if n and ubar else 0
-        chart.append({"label": key, "n": n, "defective": d, "defects": defects_n, "p": p,
-                      "p_cl": pbar, "p_ucl": min(1, pbar + 3 * se), "p_lcl": max(0, pbar - 3 * se),
-                      "u": defects_n / n, "u_cl": ubar, "u_ucl": ubar + 3 * use, "u_lcl": max(0, ubar - 3 * use)})
-    counts: dict[str, int] = defaultdict(int)
-    for d in defects:
-        counts[d["category"] or d["name"]] += 1
-    pareto, cumulative = [], 0
-    for name, count in sorted(counts.items(), key=lambda x: (-x[1], x[0].casefold())):
-        cumulative += count
-        pareto.append({"category": name, "count": count, "percent": count / defect_count * 100 if defect_count else 0,
-                       "cumulative_percent": cumulative / defect_count * 100 if defect_count else 0})
-    stability = "stable" if len(chart) >= 20 else "provisional" if len(chart) >= 5 else "insufficient"
-    return {"metrics": {"units": units, "defects": defect_count, "defective": defective, "yield": round(yield_pct, 2),
-                        "dpu": round(dpu, 4), "dpmo": round(dpmo, 0), "sigma": round(_sigma_level(dpmo), 2),
-                        "critical_defects": critical, "opportunities": opportunities},
-            "control_chart": chart, "stability": stability, "pareto": pareto, "capas": capas}
+    return {**summarize_quality(days, categories), "capas": capas}
 
 
 @router.get("/api/analytics/summary")

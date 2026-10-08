@@ -17,6 +17,8 @@ The live application code and local run instructions are below. The planned Netl
 
 The first dependency installation may need internet access. Chart.js, Bootstrap Icons, fonts, and application assets are bundled locally; normal operation is offline.
 
+Local configuration loads from `~/.config/quality-command-center/.env`, outside the source tree. Set `QCC_ENV_FILE` to use another private configuration file; process environment variables take precedence. Copy `.env.example` to that private location when configuring a new installation. Keep real database URLs and cloud secrets out of project files. Hosted deployments can supply settings through their environment/secret manager. Session cookies require HTTPS in staging/production or when `PUBLIC_ORIGIN` uses HTTPS; local HTTP development remains supported.
+
 ## Product areas
 
 - **Home** — account/process filters, p/u control chart, Yield, DPMO, Sigma level, critical findings, Pareto, and urgent CAPA queue.

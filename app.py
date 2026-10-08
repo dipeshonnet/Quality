@@ -215,11 +215,23 @@ def verify_password(password: str, salt: bytes, expected: bytes) -> bool:
     return hmac.compare_digest(digest, expected)
 
 
-def create_session(username: str) -> str:
+def create_session(username: str, expected_password_hash: bytes | None = None) -> str:
     token = secrets.token_urlsafe(32)
     token_hash = hashlib.sha256(token.encode()).hexdigest()
     now = utcnow()
     with db() as con:
+        if expected_password_hash is not None:
+            # Serialize the final credential check and session insertion with
+            # password resets and profile deactivation.
+            if not uses_postgres():
+                con.execute("BEGIN IMMEDIATE")
+            sql = """SELECT u.password_hash,p.active FROM users u
+                     JOIN user_profiles p ON p.username=u.username WHERE u.username=?"""
+            if uses_postgres():
+                sql += " FOR UPDATE OF u, p"
+            user = con.execute(sql, (username,)).fetchone()
+            if not user or not user["active"] or not hmac.compare_digest(user["password_hash"], expected_password_hash):
+                raise HTTPException(401, "Invalid username or password")
         con.execute("DELETE FROM sessions WHERE expires_at < ?", (iso_now(),))
         con.execute(
             "INSERT INTO sessions(token_hash, username, created_at, expires_at) VALUES(?,?,?,?)",
@@ -233,8 +245,12 @@ def current_user(qsr_session: str | None = Cookie(default=None)) -> str:
         raise HTTPException(401, "Authentication required")
     token_hash = hashlib.sha256(qsr_session.encode()).hexdigest()
     with db() as con:
-        row = con.execute("SELECT username, expires_at FROM sessions WHERE token_hash=?", (token_hash,)).fetchone()
+        row = con.execute("""SELECT s.username, s.expires_at, p.active FROM sessions s
+                             LEFT JOIN user_profiles p ON p.username=s.username
+                             WHERE s.token_hash=?""", (token_hash,)).fetchone()
         if not row:
+            raise HTTPException(401, "Invalid session")
+        if not row["active"]:
             raise HTTPException(401, "Invalid session")
         expires_at = row["expires_at"]
         if isinstance(expires_at, str):
@@ -829,10 +845,11 @@ def setup(payload: SetupIn, response: Response):
             "INSERT INTO users(username, password_salt, password_hash, created_at) VALUES(?,?,?,?)",
             ("admin", salt, digest, iso_now()),
         )
+        con.execute("INSERT INTO user_profiles(username,display_name,active,must_change_password,updated_at) VALUES('admin','Administrator',1,0,?)", (iso_now(),))
+        con.execute("INSERT INTO user_roles(username,role_name) VALUES('admin','Administrator')")
     token = create_session("admin")
     csrf = secrets.token_urlsafe(24)
-    response.set_cookie("qsr_session", token, httponly=True, samesite="strict", secure=False, max_age=SESSION_HOURS * 3600)
-    response.set_cookie("qsr_csrf", csrf, httponly=False, samesite="strict", secure=False, max_age=SESSION_HOURS * 3600)
+    set_auth_cookies(response, token, csrf)
     audit("SETUP_COMPLETE", "admin", "application", APP_VERSION)
     return {"ok": True, "username": "admin", "csrf_token": csrf}
 
@@ -840,16 +857,23 @@ def setup(payload: SetupIn, response: Response):
 @app.post("/api/login")
 def login(payload: LoginIn, response: Response):
     with db() as con:
-        row = con.execute("SELECT * FROM users WHERE username=?", (payload.username.strip(),)).fetchone()
-    if not row or not verify_password(payload.password, row["password_salt"], row["password_hash"]):
+        row = con.execute("""SELECT u.*, p.active FROM users u
+                             LEFT JOIN user_profiles p ON p.username=u.username
+                             WHERE u.username=?""", (payload.username.strip(),)).fetchone()
+    if not row or not row["active"] or not verify_password(payload.password, row["password_salt"], row["password_hash"]):
         logger.warning("login_failed user=%s", payload.username)
         raise HTTPException(401, "Invalid username or password")
-    token = create_session(row["username"])
+    token = create_session(row["username"], expected_password_hash=row["password_hash"])
     csrf = secrets.token_urlsafe(24)
-    response.set_cookie("qsr_session", token, httponly=True, samesite="strict", secure=False, max_age=SESSION_HOURS * 3600)
-    response.set_cookie("qsr_csrf", csrf, httponly=False, samesite="strict", secure=False, max_age=SESSION_HOURS * 3600)
+    set_auth_cookies(response, token, csrf)
     audit("LOGIN", row["username"], "session", None)
     return {"ok": True, "username": row["username"], "csrf_token": csrf}
+
+
+def set_auth_cookies(response: Response, token: str, csrf: str) -> None:
+    secure = settings.is_production_like or settings.public_origin.lower().startswith("https://")
+    response.set_cookie("qsr_session", token, httponly=True, samesite="strict", secure=secure, max_age=SESSION_HOURS * 3600)
+    response.set_cookie("qsr_csrf", csrf, httponly=False, samesite="strict", secure=secure, max_age=SESSION_HOURS * 3600)
 
 
 @app.post("/api/logout")
@@ -1200,11 +1224,11 @@ def export_run(rid: str, user: str = Depends(current_user)):
     if records:
         source_headers = list(records[0]["row"].keys())
     headers = source_headers + ["Run ID", "Account", "Sampling Method", "Selection Sequence", "Selected At"]
-    ws.append(headers)
+    ws.append([formula_safe(value) for value in headers])
     for rec in records:
         values = [formula_safe(rec["row"].get(h, "")) for h in source_headers]
         values += [detail["run_id"], detail["account_name"], detail["sampling_method"], rec["selection_sequence"], rec["selected_at"]]
-        ws.append(values)
+        ws.append([formula_safe(value) for value in values])
     ws.freeze_panes = "A2"
     ws.auto_filter.ref = ws.dimensions
 
